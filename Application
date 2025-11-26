@@ -1,0 +1,373 @@
+rm(list=ls(all=TRUE))
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(xgboost)
+library(ranger)
+library(gamlss)
+library(lubridate)
+library(readr)
+library(xtable)
+library(caret)
+
+data1 <- read_csv("data1.csv")
+
+#'Descriptive analysis of fire data.
+#'
+p <- data1 %>%
+  mutate(month_factor = fct_relevel(month_factor, 
+                                    'Jan', 'Feb' , 'Mar' , 'April', 'May' , 'June' , 'July' , 'Aug' , 'Sep' , 'Oct' , 'Nov' , 'Dec' )) %>%
+  ggplot( aes(x=month_factor, y=y)) +
+  geom_boxplot()
+
+p+  theme(axis.text=element_text(size=12),
+          strip.text.x = element_text(size = 16), 
+          axis.title=element_text(size=14),
+          plot.title = element_text(size=15))+
+  xlab('Months')+
+  ylab('Number of fires')
+
+#areas
+fator <- rep('Consolidated',265)
+fator[which(data1$x3==1)] <- 'Vegetation'
+fator[which(data1$x2==1)] <- 'Other'
+fator[which(data1$x1==1)] <- 'Recent'
+
+data1$areas <- fator
+
+p2 <- data1 %>%
+  mutate(fator = fct_relevel(fator, 
+                             'Consolidated', 'Other' , 'Vegetation')) %>%
+  ggplot( aes(x=fator, y=y)) +
+  geom_boxplot()
+
+p2+theme(axis.text=element_text(size=12),
+         strip.text.x = element_text(size = 16), 
+         axis.title=element_text(size=14),
+         plot.title = element_text(size=15))+
+  xlab('Areas')+
+  ylab('Number of fires')
+
+
+
+
+with(data1,
+     tapply(y, areas, mean))
+
+
+tabela <- data1 %>%
+  mutate(month_factor = fct_relevel(month_factor, 
+                                    'Jan', 'Feb' , 'Mar' , 'April', 'May' , 'June' , 'July' , 'Aug' , 'Sep' , 'Oct' , 'Nov' , 'Dec' )) %>% 
+  group_by(month_factor) %>% 
+  summarise(n = length(y),
+            min = min(y),
+            '1st Qu.' = quantile(y, 0.25),
+            'Median' = quantile(y, 0.50),
+            Mean = mean(y),
+            '3rd Qu.' = quantile(y, 0.75),
+            'Max.'= max(y),
+            Variance= var(y), 
+            SD= sd(y))
+
+
+xtable(tabela)
+tabela
+
+data1 <- data.frame(data1[,1:4], data1[,7:17])
+
+
+colnames(data1) <- c('y','Recent' , 'Other', 'Vegetation', 'February' , 'March' , 'April', 'May' , 'June' , 'July' , 'August' , 'September' , 'October' , 'November' , 'December' )
+
+## Training and testing set
+set.seed(1311)
+train_index = sample(1:nrow(data1), 0.8*nrow(data1), replace = FALSE)
+train <- data1[train_index,]
+test <- data1[-train_index,]
+
+
+train_x = data.matrix(train[, -1])
+train_y = train[,1]
+
+test_x = data.matrix(test[, -1])
+test_y = test[, 1]
+
+
+dtrain = xgb.DMatrix(data = train_x, label = train_y)
+dtest = xgb.DMatrix(data = test_x, label = test_y)
+
+#'
+#' XGBoost
+#' 
+
+gride_par <- expand.grid(
+  max_depth = seq(1, 10, by = 1),
+  eta = c(0.1, 0.2, 0.3, 0.4),
+  subsample= c(0.5,0.6,0.7,0.8),
+  colsample_bytree = c(0.5,0.6,0.7,0.8,0.9))
+
+
+paramList <- lapply(split(gride_par, 1:nrow(gride_par)), as.list)
+
+bestResults <- c()
+
+set.seed(1311) 
+
+pb <- txtProgressBar(style = 3)
+for(i in seq(length(paramList))) {
+  model <- xgb.cv(params = paramList[[i]],
+                  data = dtrain, 
+                  nfold = 5,
+                  nrounds = 500,
+                  early_stopping_rounds = 10,
+                  verbose = FALSE)
+  bestResults <- bestResults %>% 
+    bind_rows(model$evaluation_log[model$best_iteration])
+  gc()  
+  setTxtProgressBar(pb, i/length(paramList))
+}
+close(pb)
+
+models_xgboost_tune <- cbind(gride_par, bestResults)
+
+min(models_xgboost_tune$train_rmse_mean)
+models_xgboost_tune[which(models_xgboost_tune$train_rmse_mean == min(models_xgboost_tune$train_rmse_mean)),]
+
+
+set.seed(1311)
+model_xgboost_final <- xgb.train(data = dtrain, verbose = 0,
+                                 watchlist = list(train = dtrain, test = dtest), 
+                                 nrounds = 5000,
+                                 early_stopping_rounds = 50,
+                                 max_depth = 6,
+                                 subsample = 0.8,
+                                 colsample_bytree = 0.9,
+                                 eta = 0.3)
+
+
+#'
+#' forest
+#' 
+
+tgrid <- expand.grid(
+  .mtry = 1:14,
+  .splitrule = "variance",
+  .min.node.size = c(3,4,5,6,7)
+)
+
+set.seed(1311)
+library(caret)
+models_forest_tune <- list()
+for (num.trees in c(200,300,400,500,600)) {
+  model_caret <- train(y  ~ ., data = train,
+                       method = "ranger",
+                       trControl = trainControl(method="cv", number = 5, verboseIter = T),
+                       tuneGrid = tgrid,
+                       num.trees = num.trees,
+                       importance = "permutation")
+  key <- toString(num.trees)
+  models_forest_tune[[key]] <- model_caret 
+}
+
+models_forest_tune[[1]]$bestTune
+models_forest_tune[[2]]$bestTune
+models_forest_tune[[3]]$bestTune
+models_forest_tune[[4]]$bestTune
+models_forest_tune[[5]]$bestTune
+
+
+rmses <- c(min(models_forest_tune[[1]]$results$RMSE),
+           min(models_forest_tune[[2]]$results$RMSE),
+           min(models_forest_tune[[3]]$results$RMSE),
+           min(models_forest_tune[[4]]$results$RMSE),
+           min(models_forest_tune[[5]]$results$RMSE)
+)
+
+
+which(rmses == min(rmses))
+
+
+models_forest_tune[[4]]$results[which(models_forest_tune[[4]]$results$RMSE == min(models_forest_tune[[4]]$results$RMSE)),]
+
+set.seed(1311)
+model_forest_final <- ranger(y ~ ., data = train, 
+                             importance = "permutation",
+                             splitrule = "variance", 
+                             mtry=14,
+                             min.node.size=3,
+                             num.trees = 500
+)
+
+
+model_poiss <- glm(y~., family = 'poisson', data = train)
+
+
+library(VGAMdata)
+
+model_gpoiss <- vglm(y~., genpoisson0, data = train, trace = TRUE)
+
+
+avalia <- function(pred, obs) {
+  mse <- mean((pred - obs)^2)
+  rmse <- sqrt(mse)
+  mae <- mean(abs(pred - obs))
+  r_squared <- 1 - (sum((obs - pred)^2) / sum((obs - mean(obs))^2))
+  vaf <- (1-(var(obs-pred)/var(obs)))*100
+  mbe <- mean(obs-pred)
+  mpe <-100*mean((abs(obs-pred)/obs))
+  sse <- sum((obs-pred)^2)
+  aard <- mean(abs((obs-pred)-obs))
+  
+  res <- cbind('MSE'=mse, 
+               'RMSE'=rmse,
+               'MAE'=mae,
+               'Rsquared'=r_squared,
+               'VAF'=vaf, 
+               'MBE'=mbe, 
+               'MPE'=mpe, 
+               'SSE'=sse, 
+               'AARD'=aard )
+  return(res)
+}
+
+p_teste_xg <- predict(model_xgboost_final, dtest)
+res_xg <- avalia(p_teste_xg ,test$y)
+
+
+p_teste_forest <- predict(model_forest_final,test)$predictions
+res_forest <- avalia(p_teste_forest,test$y)
+
+
+res_p <- avalia(predict(model_poiss,newdata= test, type='response'), test$y)
+
+res_gp <- avalia(predict(model_gpoiss,newdata= test, type='response'), test$y)
+
+tab <- rbind(res_p,res_gp,res_forest,res_xg)
+
+tab1 <- round(tab,4)
+rownames(tab1) <- c('Poisson','G Poisson', 'Forest', "XGBoost")
+
+library(xtable)
+xtable(tab1[,2:5], digits=4)
+
+
+## xgboost
+
+library(treeshap)
+
+model_unified2 <- xgboost.unify(model_xgboost_final, train)
+treeshap_res2 <- treeshap(model_unified2, train)
+
+plot_feature_importance(treeshap_res2, max_vars = 14)+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+
+fshap.m <- as.matrix(treeshap_res2$shaps)
+
+
+library(shapviz)
+sv.fshap <- shapviz(fshap.m,
+                    X = train,
+                    bg_X = train) # small dataset, can see all of them
+
+sv_importance(sv.fshap, kind = "bee",number_size = 5)+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+plot_feature_dependence(treeshap_res2, 'Recent',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+plot_feature_dependence(treeshap_res2, 'Other',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+
+plot_feature_dependence(treeshap_res2, 'Vegetation',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+plot_feature_dependence(treeshap_res2, 'February',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+
+plot_feature_dependence(treeshap_res2, 'March',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+
+plot_feature_dependence(treeshap_res2, 'April',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+plot_feature_dependence(treeshap_res2, 'May',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+
+plot_feature_dependence(treeshap_res2, 'June',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+plot_feature_dependence(treeshap_res2, 'July',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+plot_feature_dependence(treeshap_res2, 'August',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+plot_feature_dependence(treeshap_res2, 'September',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+
+plot_feature_dependence(treeshap_res2, 'October',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+plot_feature_dependence(treeshap_res2, 'November',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+
+plot_feature_dependence(treeshap_res2, 'December',title = "")+
+  theme(axis.text=element_text(size=12),
+        strip.text.x = element_text(size = 16), 
+        axis.title=element_text(size=14),
+        plot.title = element_text(size=15))
+
+
