@@ -1,0 +1,101 @@
+################################################################################
+###  Simulation Study 01
+################################################################################
+
+### Generate Samples
+install.packages("gp")
+library(gp)
+
+AmGP <- function(n,B,bet,phi)
+{
+     x <- cbind(1,B) 
+    mi <- x%*%bet
+   mi1 <- exp(mi)      # mu = exp(xbeta) = theta/(1-lambda)
+lambda <- 1-(1/phi)
+   th1 <- mi1*(1-lambda)
+  resp <- numeric(n)
+  for (i in 1:n)
+  {
+    resp[i] <- rgp(2, th1[i], lambda=lambda, method = "Inversion")[1]
+  }
+  return(resp)  
+}  
+
+logv1.GP <- function(theta,B,y)
+{
+  x <- model.matrix( y ~ ., data.frame(B) )
+  p <- ncol(x)
+  n <- nrow(x)
+  beta <- theta[1:p]
+  ph1 <- theta[p+1]   
+  mu <- x%*%beta
+  mu1 <- exp(mu)
+  aux <- mu1 + (ph1-1)*y
+  logv <- sum(mu)+ sum((y-1)*log(aux))- log(ph1)*sum(y)- sum(aux)/ph1
+  -logv
+}
+#  
+
+### Simulation
+########################
+
+ Con_RPG<- function (m,bet=bet,phi=phi,ns=ns)
+ {
+        p <- length(bet)
+        s <- length(ns)
+  BetEst <- matrix(0,nrow= m, ncol=(p*s))
+  PhiEst <- matrix(0,nrow= m, ncol=s)
+        t <- 0
+  for(j in ns)
+  {  
+    x1 <- runif(j,0,1)
+    x2 <- runif(j,0,1)
+     B <- cbind(x1,x2)
+     r <- 0
+      while (r < m)
+      {
+       r <- r + 1
+       print(r) 
+    ysim <- AmGP(n=j,B=B,bet=bet,phi=phi)
+     Mod <- Rfast::qpois.reg(B, ysim, tol = 1e-7)
+    mod2 <- optim(c(Mod$be,sqrt(Mod$phi)),logv1.GP, B=B,y = ysim,control = list(maxit = 10000),hessian=TRUE )
+     par <- mod2$par   
+    BetEst[r,((1:p)+p*t)] <- par[1:p]
+     PhiEst[r,(t+1)] <- par[(p+1)]
+  write.table(BetEst,"BetEst.txt",quote=FALSE,row.names=FALSE)
+  write.table(PhiEst,"PhiEst.txt",quote=FALSE,row.names=FALSE)
+      }
+    t<- t +1
+  }  
+  return(list(BetEst = BetEst, PhiEst = PhiEst))
+ }
+
+ ###
+ betas <- c(1,1.5,3)
+     m <- 10
+    ns <- c(50,100,150,200,500,700,1000)
+ 
+    Con_RPG(m=m,bet=betas,phi=1.2,ns=ns)
+
+         
+    ### BIAS AND MSE
+    ######################
+    
+    BEst <- read.table("BetEst.txt",header=TRUE)
+    PEst <- read.table("PhiEst.txt",header=TRUE)
+    
+    Beta1 <- cbind(BEst[,1],BEst[,4],BEst[,7],BEst[,10],BEst[,13],BEst[,16],BEst[,19])
+    Beta2 <- cbind(BEst[,2],BEst[,5],BEst[,8],BEst[,11],BEst[,14],BEst[,17],BEst[,20])
+    Beta3 <- cbind(BEst[,3],BEst[,6],BEst[,9],BEst[,12],BEst[,15],BEst[,18],BEst[,21])
+    m <- nrow(Beta1)
+    
+    BiasB1 <- apply((Beta1-betas[1]),2,mean)
+    BiasB2 <- apply((Beta2-betas[2]),2,mean)
+    BiasB3 <- apply((Beta3-betas[3]),2,mean)
+    BiasPH <- apply((PEst-phi),2,mean)
+    
+    MSEB1 <- apply((Beta1-betas[1])^2,2,mean)
+    MSEB2 <- apply((Beta2-betas[2])^2,2,mean)
+    MSEB3 <- apply((Beta3-betas[3])^2,2,mean)
+    MSEPH <- apply((PEst-phi)^2,2,mean)
+    
